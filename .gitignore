@@ -5,3 +5,6 @@ logs/
 *.tar.gz
 .DS_Store
 google-chrome-stable_current_amd64.deb
+google-chrome-stable_current_amd64.deb
+tree_backups/
+tree_output_*.txt
