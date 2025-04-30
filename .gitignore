@@ -4,3 +4,4 @@ venv/
 logs/
 *.tar.gz
 .DS_Store
+google-chrome-stable_current_amd64.deb
