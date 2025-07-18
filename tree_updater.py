@@ -1,23 +1,68 @@
 #!/usr/bin/env python3
-"""
-tree_updater.py — Compact, configurable project tree snapshot
--------------------------------------------------------------
-Generate a depth‑limited, extension‑filtered directory listing for one
-or more roots and keep a rolling backup history.
+"""tree_updater - write project tree snapshots
 
-Python 3.8+, std‑lib only.
+Supports Markdown or JSON output, optional gitignore filtering,
+and automatic diff/backups. Can also be imported as a library via
+``get_tree_dict``.
 """
 
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import gzip
+import json
 import logging
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, Sequence
+
+try:
+    from pathspec import PathSpec
+except Exception:  # pragma: no cover - optional dependency
+    PathSpec = None  # type: ignore
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_INCLUDE_SUFFIXES = {
+    ".py",
+    ".pyi",
+    ".ipynb",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".json",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".txt",
+    ".md",
+    ".rst",
+    ".html",
+    ".css",
+    ".scss",
+    ".sh",
+    ".bat",
+    ".ps1",
+    ".ini",
+    ".cfg",
+    ".gradle",
+    ".kt",
+    ".java",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".go",
+    ".rs",
+    ".swift",
+}
+
+SPECIAL_NAMES = {"Dockerfile", "Makefile", "LICENSE", "README"}
 
 DEFAULT_EXCLUDE = {
     "__pycache__",
@@ -27,147 +72,250 @@ DEFAULT_EXCLUDE = {
     "venv",
     ".venv",
     "node_modules",
+    "dist",
+    "build",
+    ".idea",
+    ".pytest_cache",
+    ".mypy_cache",
 }
-DEFAULT_INCLUDE_SUFFIXES = {".py", ".md", ".txt", ".json", ".yaml", ".yml"}
+
+BACKUP_DIRNAME = "tree_backups"
+DIFF_FILE = "tree_diff_latest.txt"
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
 
-def should_include(p: Path, include: set[str], exclude_patterns: Sequence[str]) -> bool:
-    """Return True if *p* should appear in the listing."""
+def load_gitignore(root: Path) -> PathSpec | None:
+    """Load ``.gitignore`` from *root* if ``--gitignore`` is enabled."""
 
-    if p.is_dir():
-        name = p.name
-        if name in DEFAULT_EXCLUDE or any(fnmatch.fnmatch(str(p), pat) for pat in exclude_patterns):
-            return False
-        return True
-
-    return p.suffix in include and not any(fnmatch.fnmatch(str(p), pat) for pat in exclude_patterns)
+    if not (root / ".gitignore").exists() or PathSpec is None:
+        return None
+    with (root / ".gitignore").open() as fh:
+        return PathSpec.from_lines("gitwildmatch", fh)
 
 
-def scandir_deep(root: Path, max_depth: int, include: set[str], exclude_patterns: Sequence[str]) -> Iterable[str]:
-    """Yield paths **relative to *root***, depth‑first, obeying filters."""
+def match_exclude(rel: str, patterns: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatch(rel, pat) for pat in patterns)
 
-    def _walk(cur: Path, depth: int) -> Iterable[str]:
-        if depth > max_depth:
+
+# ---------------------------------------------------------------------------
+# tree building
+# ---------------------------------------------------------------------------
+
+
+def get_tree_dict(
+    roots: list[str],
+    depth: int = 2,
+    include: set[str] | None = None,
+    exclude: Sequence[str] | None = None,
+    use_gitignore: bool = False,
+) -> dict:
+    """Return a nested dictionary describing *roots*."""
+
+    inc = {s.lower() for s in (include or DEFAULT_INCLUDE_SUFFIXES)}
+    exc = list(exclude or [])
+
+    def build_node(root: Path, cur_depth: int, git: PathSpec | None) -> dict | None:
+        rel = root.relative_to(base).as_posix()
+        if git and git.match_file(rel):
+            return None
+        if match_exclude(rel, exc):
+            return None
+        if root.is_dir():
+            if root.name in DEFAULT_EXCLUDE and rel:
+                return None
+            node = {"name": rel or root.as_posix(), "type": "dir", "children": []}
+            if cur_depth >= depth:
+                return node
+            try:
+                for child in sorted(root.iterdir(), key=lambda p: p.name):
+                    child_node = build_node(child, cur_depth + 1, git)
+                    if child_node:
+                        node["children"].append(child_node)
+            except PermissionError as exc:  # pragma: no cover - permissions vary
+                logging.warning("%s", exc)
+            return node
+        else:
+            if root.name in SPECIAL_NAMES or root.suffix.lower() in inc:
+                stat = root.stat()
+                return {
+                    "name": rel,
+                    "type": "file",
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                }
+        return None
+
+    tree = {"name": "", "type": "dir", "children": []}
+    for r in map(Path, roots):
+        base = r
+        git = load_gitignore(r) if use_gitignore else None
+        node = build_node(r, 0, git)
+        if node:
+            tree["children"].append(node)
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# scanning / output helpers
+# ---------------------------------------------------------------------------
+
+
+def scandir_paths(
+    root: Path,
+    depth: int,
+    include: set[str],
+    exclude: Sequence[str],
+    git: PathSpec | None,
+) -> Iterable[str]:
+    """Yield paths relative to *root* that match filters."""
+
+    def _walk(current: Path, d: int) -> Iterable[str]:
+        if d > depth:
             return
         try:
-            with os.scandir(cur) as it:
+            with os.scandir(current) as it:
                 for entry in sorted(it, key=lambda e: e.name):
                     p = Path(entry.path)
-                    if not should_include(p, include, exclude_patterns):
+                    rel = p.relative_to(root).as_posix()
+                    if git and git.match_file(rel):
                         continue
-                    rel = p.relative_to(root)
-                    yield str(rel)
+                    if match_exclude(rel, exclude):
+                        continue
                     if entry.is_dir(follow_symlinks=False):
-                        yield from _walk(p, depth + 1)
+                        if p.name in DEFAULT_EXCLUDE and rel:
+                            continue
+                        yield rel
+                        yield from _walk(p, d + 1)
+                    else:
+                        if p.name in SPECIAL_NAMES or p.suffix.lower() in include:
+                            yield rel
         except PermissionError as exc:
-            logging.warning("\u26A0  %s", exc)
+            logging.warning("%s", exc)
 
     yield from _walk(root, 0)
 
 
 def rotate_backups(target: Path, keep: int = 10) -> None:
-    """Move *target* into a ``tree_backups`` folder with a timestamp."""
+    """Rotate snapshots in ``tree_backups`` directory."""
 
-    bdir = target.parent / "tree_backups"
+    bdir = target.parent / BACKUP_DIRNAME
     bdir.mkdir(exist_ok=True)
     if target.exists():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target.replace(bdir / f"{target.stem}_{ts}.txt")
+        backup = bdir / f"{target.stem}_{ts}.txt"
+        target.replace(backup)
     backups = sorted(bdir.glob(f"{target.stem}_*.txt"))
-    for old in backups[:-keep]:
-        old.unlink(missing_ok=True)
+    if len(backups) > keep:
+        for old in backups[:-keep]:
+            if not old.with_suffix(old.suffix + ".gz").exists():
+                with open(old, "rb") as f_in, gzip.open(
+                    old.with_suffix(old.suffix + ".gz"), "wb"
+                ) as f_out:
+                    f_out.write(f_in.read())
+                old.unlink(missing_ok=True)
 
 
-def build_listing(roots: Sequence[Path], depth: int, inc: set[str], exc: Sequence[str]) -> str:
-    """Return a formatted snapshot for *roots*."""
-
-    lines: List[str] = [
-        f"# project-tree snapshot · {datetime.utcnow().isoformat(timespec='seconds')}Z",
-        "",
-    ]
-    for r in roots:
-        if not r.exists():
-            logging.warning("Root not found: %s", r)
-            continue
-        lines.append(f"## {r}")
-        for entry in scandir_deep(r, depth, inc, exc):
-            lines.append(entry)
-        lines.append("")  # blank line between roots
-    return "\n".join(lines)
+def compute_diff(prev: Path, new: Path, diff_path: Path) -> tuple[int, int]:
+    prev_lines: list[str] = []
+    if prev.exists():
+        prev_lines = prev.read_text(encoding="utf-8").splitlines()[1:]
+    new_lines = new.read_text(encoding="utf-8").splitlines()[1:]
+    added = sorted(set(new_lines) - set(prev_lines))
+    removed = sorted(set(prev_lines) - set(new_lines))
+    with diff_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"added: {len(added)}\nremoved: {len(removed)}\n")
+        for line in added[:100]:
+            fh.write(f"+ {line}\n")
+        for line in removed[:100]:
+            fh.write(f"- {line}\n")
+    return len(added), len(removed)
 
 
-def parse_args(argv: List[str] | None) -> argparse.Namespace:
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=(
-            "Write a depth-limited file tree to disk. "
-            "File suffixes may be given without a leading dot to "
-            "match any extension of that name."
-        ),
+        description="Write a depth-limited file tree to disk",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--roots", nargs="+", type=Path, required=True)
     p.add_argument(
-        "--roots",
-        nargs="+",
-        type=Path,
-        required=True,
-        help="One or more directories to scan",
+        "--depth", "-d", type=int, default=2, help="Descending levels per root"
     )
+    p.add_argument("--include", "-i", nargs="*", default=list(DEFAULT_INCLUDE_SUFFIXES))
     p.add_argument(
-        "--max-depth",
-        "-d",
-        type=int,
-        default=2,
-        help="Descending levels per root",
+        "--exclude", "-x", nargs="*", default=[], help="Extra glob patterns to exclude"
     )
+    p.add_argument("--out", "-o", type=Path, required=True, help="Output snapshot path")
+    p.add_argument("--verbose", "-v", action="store_true")
+
+    p.add_argument("--json", action="store_true", help="Write JSON instead of Markdown")
+    p.add_argument("--gitignore", action="store_true", help="Honor .gitignore files")
     p.add_argument(
-        "--include",
-        "-i",
-        nargs="*",
-        default=list(DEFAULT_INCLUDE_SUFFIXES),
-        help="File suffixes to include (omit dot for wildcard match)",
+        "--no-backup", action="store_true", help="Skip rotating tree_backups"
     )
-    p.add_argument(
-        "--exclude",
-        "-x",
-        nargs="*",
-        default=[],
-        help="Extra glob patterns to exclude",
-    )
-    p.add_argument("--out", "-o", type=Path, required=True, help="Output path")
-    p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument(
-        "--no-default-excludes",
-        action="store_true",
-        help="Do not exclude common project directories like .git or node_modules",
-    )
+    p.add_argument("--no-diff", action="store_true", help="Skip diff generation")
     return p.parse_args(argv)
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
 
-    include_set = {s if s.startswith(".") else f".{s}" for s in args.include}
+    include = {s if s.startswith(".") else f".{s}" for s in args.include}
+    include = {s.lower() for s in include}
+    exclude = list(args.exclude)
+    roots = [Path(r) for r in args.roots]
 
-    excludes = list(args.exclude)
-    if args.no_default_excludes:
-        logging.debug("Default exclusions disabled")
-    else:
-        excludes.extend(DEFAULT_EXCLUDE)
+    for r in roots:
+        if not r.exists():
+            logging.warning("Root not found: %s", r)
 
-    logging.info("\U0001F4E6 scanning…")
-    listing = build_listing(args.roots, args.max_depth, include_set, excludes)
+    prev_snapshot = args.out if args.out.exists() else None
 
-    rotate_backups(args.out)
+    if not args.no_backup:
+        rotate_backups(args.out)
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(listing, encoding="utf-8")
-    logging.info("\u2705 wrote %s  (%d lines)", args.out, len(listing.splitlines()))
+    with args.out.open("w", encoding="utf-8") as fh:
+        header = f"# project-tree snapshot · {datetime.utcnow().isoformat(timespec='seconds')}Z"
+        print(header, file=fh)
+        print(file=fh)
+        for root in roots:
+            print(f"## {root.as_posix()}", file=fh)
+            git = load_gitignore(root) if args.gitignore else None
+            for rel in scandir_paths(root, args.depth, include, exclude, git):
+                print(rel, file=fh)
+            print(file=fh)
+
+    if args.json:
+        tree = get_tree_dict(
+            [str(r) for r in roots],
+            depth=args.depth,
+            include=include,
+            exclude=exclude,
+            use_gitignore=args.gitignore,
+        )
+        json_path = args.out.with_suffix(".json")
+        json_path.write_text(json.dumps(tree, indent=2), encoding="utf-8")
+        logging.info("wrote JSON snapshot %s", json_path)
+
+    if not args.no_diff:
+        diff_path = args.out.parent / DIFF_FILE
+        added, removed = compute_diff(prev_snapshot or args.out, args.out, diff_path)
+        logging.info("diff: +%d -%d (see %s)", added, removed, diff_path)
+
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - manual execution
-    sys.exit(main())
-
+if __name__ == "__main__":  # pragma: no cover - script mode
+    raise SystemExit(main())
