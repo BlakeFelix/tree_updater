@@ -17,6 +17,12 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - optional dependency
+    yaml = None
 
 try:
     from pathspec import PathSpec
@@ -257,6 +263,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
     p.add_argument("--json", action="store_true", help="Write JSON instead of Markdown")
     p.add_argument("--gitignore", action="store_true", help="Honor .gitignore files")
+    p.add_argument("--config", type=Path, help="YAML/JSON file with default roots/include/exclude/depth")
+    p.add_argument("--skip-unchanged", action="store_true", help="Abort if no tree change (ignoring timestamp line)")
     p.add_argument(
         "--no-backup", action="store_true", help="Skip rotating tree_backups"
     )
@@ -266,6 +274,23 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # ------------------------------------------------------------------
+    # If --config supplied, merge values (CLI still wins)
+    # ------------------------------------------------------------------
+    if args.config and args.config.exists():
+        with args.config.open() as fh:
+            cfg = yaml.safe_load(fh) if args.config.suffix in {".yml", ".yaml"} \
+                else json.load(fh)
+        # merge helpers
+        def merge(key, default):
+            return cfg.get(key, default)
+
+        args.roots = merge("roots", args.roots)
+        args.depth = merge("depth", args.depth)
+        args.include = merge("include", args.include)
+        args.exclude = merge("exclude", args.exclude)
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
@@ -280,6 +305,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not r.exists():
             logging.warning("Root not found: %s", r)
 
+    unchanged = False
+    if args.skip_unchanged and args.out.exists():
+        prev_lines = args.out.read_text(encoding="utf-8").splitlines()[1:]
+        current = []
+        for r in args.roots:
+            git = load_gitignore(r) if args.gitignore else None
+            current.extend(scandir_paths(Path(r), args.depth,
+                {s.lower() if s.startswith('.') else f'.{s}'.lower() for s in args.include},
+                list(args.exclude), git))
+        unchanged = set(prev_lines) == set(current)
+        if unchanged:
+            logging.info("snapshot unchanged – exiting")
+            return 0
+
     prev_snapshot = args.out if args.out.exists() else None
 
     if not args.no_backup:
@@ -290,10 +329,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         header = f"# project-tree snapshot · {datetime.utcnow().isoformat(timespec='seconds')}Z"
         print(header, file=fh)
         print(file=fh)
-        for root in roots:
-            print(f"## {root.as_posix()}", file=fh)
+        def _one_root(root: Path) -> list[str]:
             git = load_gitignore(root) if args.gitignore else None
-            for rel in scandir_paths(root, args.depth, include, exclude, git):
+            return list(scandir_paths(root, args.depth, include, exclude, git))
+
+        with ThreadPoolExecutor(max_workers=len(roots)) as pool:
+            results = pool.map(_one_root, roots)
+
+        for root, rels in zip(roots, results):
+            print(f"## {root.as_posix()}", file=fh)
+            for rel in rels:
                 print(rel, file=fh)
             print(file=fh)
 

@@ -23,6 +23,21 @@ Import the library function:
 from tree_updater import get_tree_dict
 ```
 
+New in this release:
+
+- `--config FILE` loads defaults for `roots`, `include`, `exclude` and `depth` from a YAML or JSON file (CLI flags override).
+- `--skip-unchanged` exits early when the snapshot has not changed.
+- Multiple roots are scanned in parallel for faster I/O.
+
+Example YAML config:
+
+```yaml
+roots:
+  - .
+depth: 2
+include: [py, md]
+exclude: [build/*]
+```
 
 Install dependencies with:
-`python -m pip install pathspec>=0.12.0`
+`python -m pip install pathspec>=0.12.0 PyYAML>=6.0`

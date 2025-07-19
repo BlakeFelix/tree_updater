@@ -2,14 +2,26 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+import argparse
 import time
 import os
 from pathlib import Path
 
+CONFIG = Path.home() / ".auto_uploader_config"
 TREE_FILE_PATH = str(Path.home() / "tree_updater" / "tree_output_compact.txt")
 CHATGPT_URL = "https://chat.openai.com/"
 
 def main():
+    parser = argparse.ArgumentParser(description="Upload a tree snapshot to ChatGPT")
+    parser.add_argument("--file", type=Path, help="Override tree snapshot path")
+    args = parser.parse_args()
+
+    snapshot = args.file
+    if snapshot is None and CONFIG.exists():
+        snapshot = Path(CONFIG.read_text().strip())
+    if snapshot is None:
+        snapshot = Path(TREE_FILE_PATH)
+
     print("[🛡️] Starting cautious uploader (Google Chrome, patched for Selenium 4.31+)...")
 
     options = Options()
@@ -34,8 +46,8 @@ def main():
         upload_button.click()
         time.sleep(2)
         file_input = driver.find_element(By.XPATH, "//input[@type='file']")
-        file_input.send_keys(TREE_FILE_PATH)
-        print(f"[📂] Uploaded: {TREE_FILE_PATH}")
+        file_input.send_keys(str(snapshot))
+        print(f"[📂] Uploaded: {snapshot}")
     except Exception as e:
         print(f"[⚠️] Upload failed: {e}")
 
