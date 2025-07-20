@@ -14,7 +14,7 @@ import gzip
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -326,7 +326,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as fh:
-        header = f"# project-tree snapshot · {datetime.utcnow().isoformat(timespec='seconds')}Z"
+        header = (
+            "# project-tree snapshot · "
+            f"{datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}"
+        )
         print(header, file=fh)
         print(file=fh)
         def _one_root(root: Path) -> list[str]:
