@@ -11,9 +11,18 @@ CONFIG = Path.home() / ".auto_uploader_config"
 TREE_FILE_PATH = str(Path.home() / "tree_updater" / "tree_output_compact.txt")
 CHATGPT_URL = "https://chat.openai.com/"
 
+USER_DATA_ENV = "CHROME_USER_DATA_DIR"
+CHROMEDRIVER_ENV = "CHROMEDRIVER"
+DEFAULT_USER_DATA_DIR = os.getenv(USER_DATA_ENV, "/home/erisfelix/.config/google-chrome")
+DEFAULT_CHROMEDRIVER = os.getenv(CHROMEDRIVER_ENV, "/usr/bin/chromedriver")
+
 def main():
     parser = argparse.ArgumentParser(description="Upload a tree snapshot to ChatGPT")
     parser.add_argument("--file", type=Path, help="Override tree snapshot path")
+    parser.add_argument("--user-data-dir", default=DEFAULT_USER_DATA_DIR,
+                        help="Chrome user data directory")
+    parser.add_argument("--chromedriver", default=DEFAULT_CHROMEDRIVER,
+                        help="Path to chromedriver executable")
     args = parser.parse_args()
 
     snapshot = args.file
@@ -26,13 +35,13 @@ def main():
 
     options = Options()
     options.add_argument("--start-maximized")
-    options.add_argument("user-data-dir=/home/erisfelix/.config/google-chrome")
+    options.add_argument(f"user-data-dir={args.user_data_dir}")
     options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
     # Correct for Selenium 4.31+ to force classic handshake
     options.set_capability("goog:chromeOptions", {"w3c": False})
 
-    chrome_service = Service(executable_path="/usr/bin/chromedriver")
+    chrome_service = Service(executable_path=args.chromedriver)
     driver = webdriver.Chrome(service=chrome_service, options=options)
 
     driver.get(CHATGPT_URL)
