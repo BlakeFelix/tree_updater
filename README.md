@@ -4,6 +4,7 @@
 standard Markdown or, with `--json`, a nested JSON structure. The script writes
 `tree_output_compact.txt` (or the specified `--out` path) and maintains rolling
 backups and diffs.
+Snapshot headers use a timezone-aware UTC timestamp like `# project-tree snapshot · 2024-01-01T00:00:00Z` (note the trailing `Z`) as produced by `tree_updater.py`.
 
 ## Usage
 
