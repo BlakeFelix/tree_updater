@@ -305,17 +305,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not r.exists():
             logging.warning("Root not found: %s", r)
 
-    unchanged = False
     if args.skip_unchanged and args.out.exists():
         prev_lines = args.out.read_text(encoding="utf-8").splitlines()[1:]
         current = []
         for r in args.roots:
             git = load_gitignore(r) if args.gitignore else None
-            current.extend(scandir_paths(Path(r), args.depth,
-                {s.lower() if s.startswith('.') else f'.{s}'.lower() for s in args.include},
-                list(args.exclude), git))
-        unchanged = set(prev_lines) == set(current)
-        if unchanged:
+            current.extend(
+                scandir_paths(
+                    Path(r),
+                    args.depth,
+                    {s.lower() if s.startswith(".") else f".{s}".lower() for s in args.include},
+                    list(args.exclude),
+                    git,
+                )
+            )
+        if set(prev_lines) == set(current):
             logging.info("snapshot unchanged – exiting")
             return 0
 
